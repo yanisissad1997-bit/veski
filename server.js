@@ -1,184 +1,314 @@
-
 const http = require("http");
 const { URL } = require("url");
 
 const PORT = process.env.PORT || 10000;
-const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const VERIFY_SERVICE_SID = process.env.TWILIO_VERIFY_SERVICE_SID;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
-/*
-  VESKI SMS FLOW — compatible with the EXISTING VESKI HTML
+// VESKI — Twilio backend v3
+const pending = new Map();
+let lastIncoming = null;
 
-  1) VESKI POST /api/mo-register { phone, code }
-  2) VESKI opens the native SMS app addressed to the Twilio number.
-  3) User sends the displayed code by SMS.
-  4) Twilio POSTs the incoming SMS to /sms.
-  5) We mark the registered code as verified.
-  6) VESKI polls GET /api/mo-status?code=... and continues.
-*/
+function getCorsHeaders(req) {
+  let allowed = String(ALLOWED_ORIGIN).trim();
 
-const pending = new Map(); // code -> { phone, createdAt, verified, from }
+  if (allowed !== "*" && !/^https?:\/\//i.test(allowed)) {
+    allowed = "https://" + allowed;
+  }
 
-function json(res, status, data) {
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+  return {
+    "Access-Control-Allow-Origin": allowed === "*" ? "*" : allowed,
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Vary": "Origin",
     "Cache-Control": "no-store"
+  };
+}
+
+function json(res, req, status, data) {
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    ...getCorsHeaders(req)
   });
+
   res.end(JSON.stringify(data));
 }
 
-function text(res, status, body) {
-  res.writeHead(status, {
-    "Content-Type": "text/plain; charset=utf-8",
-    "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-    "Cache-Control": "no-store"
+function twiml(res, req) {
+  res.writeHead(200, {
+    "Content-Type": "text/xml; charset=utf-8",
+    ...getCorsHeaders(req)
   });
-  res.end(body);
+
+  res.end(
+    '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+  );
 }
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
+
     req.on("data", chunk => {
       body += chunk;
+
       if (body.length > 20000) {
-        req.destroy();
         reject(new Error("Payload trop volumineux"));
+        req.destroy();
       }
     });
+
     req.on("end", () => resolve(body));
     req.on("error", reject);
   });
 }
 
 function validPhone(phone) {
-  return typeof phone === "string" && /^\+[1-9]\d{7,14}$/.test(phone);
+  return !phone || /^\+[1-9]\d{7,14}$/.test(phone);
+}
+
+function extractCode(text) {
+  const matches = String(text || "").match(/\b(\d{4,10})\b/g);
+
+  if (!matches) return null;
+
+  return matches[matches.length - 1];
 }
 
 function cleanup() {
   const now = Date.now();
-  for (const [code, item] of pending) {
-    if (now - item.createdAt > 10 * 60 * 1000) pending.delete(code);
+
+  for (const [code, item] of pending.entries()) {
+    if (now - item.createdAt > 10 * 60 * 1000) {
+      pending.delete(code);
+    }
+  }
+
+  if (lastIncoming && now - lastIncoming.at > 10 * 60 * 1000) {
+    lastIncoming = null;
   }
 }
+
 setInterval(cleanup, 60 * 1000).unref();
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === "OPTIONS") return json(res, 204, { ok: true });
 
-  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  // CORS
+  if (req.method === "OPTIONS") {
+    return json(res, req, 204, { ok: true });
+  }
+
+  const url = new URL(
+    req.url,
+    `http://${req.headers.host || "localhost"}`
+  );
 
   try {
+
+    // --------------------------------------------------
+    // HEALTH
+    // --------------------------------------------------
+
     if (req.method === "GET" && url.pathname === "/health") {
-      return json(res, 200, {
+      return json(res, req, 200, {
         ok: true,
-        service: "VESKI Twilio backend v2",
-        configured: Boolean(ACCOUNT_SID && AUTH_TOKEN),
-        pendingCodes: pending.size
+        service: "VESKI Twilio backend v3",
+        configured: true,
+        pendingCodes: pending.size,
+        lastIncomingReceived: Boolean(lastIncoming)
       });
     }
 
-    // Existing VESKI HTML posts here when it creates the verification code.
-    if (req.method === "POST" && url.pathname === "/api/mo-register") {
+    // --------------------------------------------------
+    // VESKI → ENREGISTRER LE CODE
+    // --------------------------------------------------
+
+    if (
+      req.method === "POST" &&
+      url.pathname === "/api/mo-register"
+    ) {
       const raw = await readBody(req);
       const body = raw ? JSON.parse(raw) : {};
+
       const phone = String(body.phone || "").trim();
       const code = String(body.code || "").trim();
 
-      if (!validPhone(phone) || !/^\d{4,10}$/.test(code)) {
-        return json(res, 400, {
+      if (!/^\d{4,10}$/.test(code)) {
+        return json(res, req, 400, {
           ok: false,
-          error: "Numéro ou code invalide."
+          error: "Code invalide."
+        });
+      }
+
+      if (!validPhone(phone)) {
+        return json(res, req, 400, {
+          ok: false,
+          error: "Numéro invalide."
         });
       }
 
       pending.set(code, {
-        phone,
+        phone: phone,
         createdAt: Date.now(),
         verified: false,
         from: null
       });
 
-      return json(res, 200, {
+      // Si le SMS était déjà arrivé
+      if (lastIncoming && lastIncoming.code === code) {
+        const item = pending.get(code);
+
+        item.verified = true;
+        item.from = lastIncoming.from;
+        item.verifiedAt = lastIncoming.at;
+      }
+
+      console.log("[VESKI REGISTER]", {
+        phone: phone,
+        code: code
+      });
+
+      return json(res, req, 200, {
         ok: true,
         registered: true,
         expiresInSeconds: 600
       });
     }
 
-    // Existing VESKI HTML polls this as a GET with ?code=...
-    if (req.method === "GET" && url.pathname === "/api/mo-status") {
-      const code = String(url.searchParams.get("code") || "").trim();
-      const item = pending.get(code);
+    // --------------------------------------------------
+    // VESKI → VÉRIFIER LE CODE
+    // --------------------------------------------------
 
-      if (!item) {
-        return json(res, 200, { ok: true, verified: false });
-      }
+    if (
+      req.method === "GET" &&
+      url.pathname === "/api/mo-status"
+    ) {
+      const code = String(
+        url.searchParams.get("code") || ""
+      ).trim();
 
-      if (Date.now() - item.createdAt > 10 * 60 * 1000) {
-        pending.delete(code);
-        return json(res, 200, { ok: true, verified: false, expired: true });
-      }
+      let item = pending.get(code);
 
-      return json(res, 200, {
-        ok: true,
-        verified: Boolean(item.verified),
-        status: item.verified ? "approved" : "pending"
-      });
-    }
+      // Vérification supplémentaire avec le dernier SMS reçu
+      if (lastIncoming && lastIncoming.code === code) {
 
-    // Twilio calls this when an incoming SMS arrives on +1 860 703 5274.
-    if (req.method === "POST" && url.pathname === "/sms") {
-      const raw = await readBody(req);
-      const params = new URLSearchParams(raw);
+        if (!item) {
 
-      const from = String(params.get("From") || "").trim();
-      const body = String(params.get("Body") || "").trim();
+          item = {
+            phone: "",
+            createdAt: Date.now(),
+            verified: true,
+            from: lastIncoming.from,
+            verifiedAt: lastIncoming.at
+          };
 
-      // Accept the exact numeric code that VESKI registered.
-      const match = body.match(/^\s*(\d{4,10})\s*$/);
-      if (match) {
-        const code = match[1];
-        const item = pending.get(code);
+          pending.set(code, item);
 
-        if (item) {
-          // Prefer the phone used to register, but don't reject a trial
-          // test if Twilio normalizes the number differently.
+        } else {
+
           item.verified = true;
-          item.from = from || null;
-          item.verifiedAt = Date.now();
+          item.from = lastIncoming.from;
+          item.verifiedAt = lastIncoming.at;
+
         }
       }
 
-      // Twilio accepts empty TwiML for this use case.
-      return text(res, 200, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response></Response>");
-    }
-
-    // Backward-compatible endpoint: POST body { phone, code }.
-    if (req.method === "POST" && url.pathname === "/api/mo-status") {
-      const raw = await readBody(req);
-      const body = raw ? JSON.parse(raw) : {};
-      const code = String(body.code || "").trim();
-      const item = pending.get(code);
-
-      return json(res, 200, {
+      return json(res, req, 200, {
         ok: true,
-        verified: Boolean(item && item.verified)
+        verified: Boolean(item && item.verified),
+        status:
+          item && item.verified
+            ? "approved"
+            : "pending"
       });
     }
 
-    return json(res, 404, { ok: false, error: "Route introuvable." });
-  } catch (err) {
-    console.error(err);
-    return json(res, 400, { ok: false, error: err.message || "Erreur" });
+    // --------------------------------------------------
+    // TWILIO → RÉCEPTION SMS
+    // --------------------------------------------------
+
+    if (
+      req.method === "POST" &&
+      url.pathname === "/sms"
+    ) {
+      const raw = await readBody(req);
+
+      const params = new URLSearchParams(raw);
+
+      const from = String(
+        params.get("From") || ""
+      ).trim();
+
+      const body = String(
+        params.get("Body") || ""
+      ).trim();
+
+      const code = extractCode(body);
+
+      console.log("[VESKI SMS]", {
+        from: from,
+        body: body,
+        code: code,
+        time: new Date().toISOString()
+      });
+
+      // Si un code numérique est trouvé
+      if (code) {
+
+        lastIncoming = {
+          code: code,
+          from: from,
+          at: Date.now()
+        };
+
+        const item = pending.get(code);
+
+        if (item) {
+
+          item.verified = true;
+          item.from = from || null;
+          item.verifiedAt = Date.now();
+
+        } else {
+
+          // Permet de reconnaître le code même
+          // si le serveur a redémarré entre temps.
+          pending.set(code, {
+            phone: "",
+            createdAt: Date.now(),
+            verified: true,
+            from: from || null,
+            verifiedAt: Date.now()
+          });
+
+        }
+      }
+
+      // Réponse Twilio sans SMS automatique
+      return twiml(res, req);
+    }
+
+    // --------------------------------------------------
+    // 404
+    // --------------------------------------------------
+
+    return json(res, req, 404, {
+      ok: false,
+      error: "Route introuvable."
+    });
+
+  } catch (error) {
+
+    console.error("[VESKI ERROR]", error);
+
+    return json(res, req, 400, {
+      ok: false,
+      error: error.message || "Erreur serveur"
+    });
   }
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`VESKI Twilio backend v2 listening on ${PORT}`);
+  console.log(
+    "VESKI Twilio backend v3 listening on " + PORT
+  );
 });
